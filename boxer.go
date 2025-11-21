@@ -2,13 +2,14 @@ package bubbleboxer
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/muesli/ansi"
 )
 
-var (
+const (
 	// NEWLINE is used to separat the lines
 	NEWLINE = "\n"
 	// SPACE is used to fill up the lines, make sure it is only one column wide and a single character
@@ -21,57 +22,64 @@ var (
 	VerticalSeparator = "─"
 )
 
-// Boxer is a way to render multiple tea.Model's in a specific layout
-// according to a LayoutTree.
-// The Model's are kept separate from the LayoutTree
-// so that changing a Model does not require traversing the LayoutTree.
-type Boxer struct {
+// Orientation specifies the rendering orientation.
+type Orientation uint8
 
-	// LayoutTree holds the root node and thus the hole LayoutTree
-	// Change it as you like as long as every node without children was
-	// created with CreateLeaf (to make sure that every leave has a corresponding ModelMap entry)
-	// After deleting a Leaf delete the corresponding entry from ModelMap if you care about memory-leaks
-	LayoutTree Node
+const (
+	Horizontal Orientation = iota + 1
+	Vertical
+)
 
-	// ModelMap is a mapping between the Address of a Leaf and the according Model.
+// SizeFunc is the function that defines the dynamic width or height of nodes.
+type SizeFunc func(n Node, widthOrHeight int) []int
+
+// Layout is a way to render multiple `tea.Model“s in a specific layout.
+// The models are kept separate from the layout tree so that changing a Model
+// does not require traversing the tree.
+type Layout struct {
+	// root holds the root node and thus the entire layout tree.
+	root Node
+
+	// modelMap is a mapping between the address of a leaf and the according Model.
 	// A valid entry can only be created with CreateLeaf,
-	// because entries without a corresponding Node in the LayoutTree are meaningless.
-	ModelMap map[string]tea.Model
+	// because entries without a corresponding Node in the layout tree are meaningless.
+	modelMap map[string]tea.Model
+
+	logger *slog.Logger
 }
 
-// Node is a node in a layout tree or when created with CreateLeaf its a valid leave of the LayoutTree
-type Node struct {
-	Children []Node
-
-	// VerticalStacked specifies the orientation of the Children to each other
-	VerticalStacked bool
-
-	// SizeFunc specifies the width or height (depending on the orientation) provided to each child.
-	// Here by should the sum of the returned int's be the same as the argument 'widthOrHeight'.
-	// The length of the returned slice should be the same as the amount of children of the node argument.
-	SizeFunc func(node Node, widthOrHeight int) []int
-
-	// noBorder is private because when it changes, the descendants size has to be changed as well
-	noBorder bool
-
-	// address is private so that it can only be set if a corresponding entry in Boxer.ModelMap is created (see CreateLeaf)
-	address string
-
-	width  int
-	height int
+// New returns a new Layout.
+func NewLayout(root Node, logger *slog.Logger) *Layout {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Layout{
+		root:     root,
+		modelMap: make(map[string]tea.Model),
+		logger:   logger,
+	}
 }
 
-// SizeError conveys that for at leased one node or leaf in the Layout-tree there was not enough space left
-type SizeError error
-
-// NotFoundError convey that the address was not found.
-type NotFoundError error
+// AddLeaf adds a new leaf node to the tree.
+func (b *Layout) AddLeaf(address string, model tea.Model) (Node, error) {
+	if address == "" {
+		return Node{}, fmt.Errorf("address should not be empty")
+	}
+	if model == nil {
+		return Node{}, fmt.Errorf("model should not be nil")
+	}
+	b.modelMap[address] = model
+	return Node{
+		address:    address,
+		withBorder: true,
+	}, nil
+}
 
 // Init satisfies the tea.Model interface
-func (b Boxer) Init() tea.Cmd { return nil }
+func (b *Layout) Init() tea.Cmd { return nil }
 
 // Update handles WindowSizeMsg and ctrl+c
-func (b Boxer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (b *Layout) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -85,16 +93,104 @@ func (b Boxer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return b, nil
 }
 
+// UpdateSize set the width and height of all Node's
+func (b *Layout) UpdateSize(size tea.WindowSizeMsg) error {
+	return b.root.updateSize(size, b.modelMap)
+}
+
 // View renders the contained tea.Model's according to the LayoutTree
-func (b Boxer) View() string {
-	if b.LayoutTree.width <= 0 || b.LayoutTree.height <= 0 {
-		return "waiting for size information"
+func (b *Layout) View() string {
+	if b.root.width <= 0 || b.root.height <= 0 {
+		b.logger.Debug("waiting for size information")
+		return ""
 	}
-	lines, err := b.LayoutTree.render(b.ModelMap)
+	lines, err := b.root.render(b.modelMap)
 	if err != nil {
-		return err.Error()
+		b.logger.Warn(err.Error())
+		return ""
 	}
 	return strings.Join(lines, NEWLINE)
+}
+
+// NotFoundError convey that the address was not found.
+type NotFoundError error
+
+// EditLeaf is a saver way to interact with the Leafs,
+// since it can not be forgotten to save back the Model after changing.
+// If the editFunc returns an error the Model is not saved.
+func (b *Layout) EditLeaf(address string, editFunc func(tea.Model) (tea.Model, error)) error {
+	model, ok := b.modelMap[address]
+	if !ok {
+		return NotFoundError(fmt.Errorf("address '%s' not found", address))
+	}
+
+	model, err := editFunc(model)
+	// discard if error
+	if err != nil {
+		return err
+	}
+
+	// accept change
+	b.modelMap[address] = model
+	return nil
+}
+
+// IsLeaf returns if the node is a leaf.
+func (n *Node) IsLeaf() bool {
+	return n.address != ""
+}
+
+// Node is a node in a layout tree.
+type Node struct {
+	children []Node
+
+	// orientation specifies the orientation of the Children to each other
+	orientation Orientation
+
+	// sizeFunc specifies the width or height (depending on the orientation) provided to each child.
+	// Here by should the sum of the returned int's be the same as the argument 'widthOrHeight'.
+	// The length of the returned slice should be the same as the amount of children of the node argument.
+	sizeFunc SizeFunc
+
+	// withBorder specifies whether the node is rendered with a border
+	withBorder bool
+
+	// address is private so that it can only be set if a corresponding entry in Boxer.ModelMap is created (see CreateLeaf)
+	address string
+
+	width  int
+	height int
+}
+
+// NewNode returns a new Node.
+func NewNode(o Orientation, withBorder bool) *Node {
+	return &Node{
+		orientation: o,
+		withBorder:  withBorder,
+	}
+}
+
+// AddChild adds a new child to this node.
+func (n *Node) AddChild(child Node) {
+	n.children = append(n.children, child)
+}
+
+// GetAddress returns the Address of the Node
+// The address of a Node is only settable through CreateLeaf
+func (n *Node) GetAddress() string {
+	return n.address
+}
+
+// GetWidth returns the current with of this node
+func (n *Node) GetWidth() int { return n.width }
+
+// GetHeight returns the current with of this node
+func (n *Node) GetHeight() int { return n.height }
+
+// SetSizeFunc sets the function that defines the dynamic width or height of
+// children nodes.
+func (n *Node) SetSizeFunc(sf SizeFunc) {
+	n.sizeFunc = sf
 }
 
 // render recursively renders the layout tree with the models contained in ModelMap
@@ -118,34 +214,34 @@ func (n *Node) render(modelMap map[string]tea.Model) ([]string, error) {
 	}
 
 	// is node
-	if n.VerticalStacked {
+	if n.orientation == Vertical {
 		return n.renderVertical(modelMap)
 	}
 	return n.renderHorizontal(modelMap)
 }
 
 func (n *Node) renderVertical(modelMap map[string]tea.Model) ([]string, error) {
-	if len(n.Children) == 0 {
+	if len(n.children) == 0 {
 		return nil, fmt.Errorf("no children to render - this node should be a leaf (see CreateLeaf) or it should not exist")
 	}
 
 	boxes := make([]string, 0, n.height)
 
-	targetWidth := n.Children[0].width
+	targetWidth := n.children[0].width
 
-	for i, child := range n.Children {
+	for i, child := range n.children {
 		if child.width != targetWidth {
 			return nil, fmt.Errorf("inconsistent size information: all children should have the same width when vertical arranged but did not")
 		}
 		lines, err := child.render(modelMap)
 		if err != nil {
-			return lines, wrapError(i, n.VerticalStacked, err)
+			return lines, wrapError(i, n.orientation, err)
 		}
 		if len(lines) > child.height {
 			err := fmt.Errorf("model has too much lines: %d, when it should have at most %d", len(lines), child.height)
-			return lines, wrapError(i, n.VerticalStacked, err)
+			return lines, wrapError(i, n.orientation, err)
 		}
-		if !n.noBorder && i > 0 {
+		if !n.withBorder && i > 0 {
 			lines = append([]string{strings.Repeat(VerticalSeparator, targetWidth)}, lines...)
 		}
 		// check for too wide lines and because we are on it, pad them to correct width.
@@ -153,7 +249,7 @@ func (n *Node) renderVertical(modelMap map[string]tea.Model) ([]string, error) {
 			lineWidth := ansi.PrintableRuneWidth(line)
 			if lineWidth > targetWidth {
 				err := fmt.Errorf("to long line: %s", line)
-				return lines, wrapError(i, n.VerticalStacked, err)
+				return lines, wrapError(i, n.orientation, err)
 			}
 			lines[i] = fmt.Sprintf("%s%s", line, strings.Repeat(SPACE, targetWidth-lineWidth))
 		}
@@ -164,34 +260,34 @@ func (n *Node) renderVertical(modelMap map[string]tea.Model) ([]string, error) {
 		}
 	}
 	return boxes, nil
-
 }
+
 func (n *Node) renderHorizontal(modelMap map[string]tea.Model) ([]string, error) {
-	if len(n.Children) == 0 {
+	if len(n.children) == 0 {
 		return nil, fmt.Errorf("no children to render - this node should be a leaf or should not exist")
 	}
 	//            y  x
 	var joinedStr [][]string
-	targetHeigth := n.Children[0].height
+	targetHeight := n.children[0].height
 
 	// bring all to same height if they are smaller then there own size
-	for i, boxer := range n.Children {
-		if targetHeigth != boxer.height {
+	for i, boxer := range n.children {
+		if targetHeight != boxer.height {
 			err := fmt.Errorf("inconsistent size information: all children should have the same height when horizontal arranged but did not")
-			return nil, wrapError(i, n.VerticalStacked, err)
+			return nil, wrapError(i, n.orientation, err)
 		}
 
 		lines, err := boxer.render(modelMap)
 		if err != nil {
-			return lines, wrapError(i, n.VerticalStacked, err)
+			return lines, wrapError(i, n.orientation, err)
 		}
 
-		if len(lines) > targetHeigth {
-			err := fmt.Errorf("model has too much lines: %d, when it should have at most %d", len(lines), targetHeigth)
-			return lines, wrapError(i, n.VerticalStacked, err)
+		if len(lines) > targetHeight {
+			err := fmt.Errorf("model has too much lines: %d, when it should have at most %d", len(lines), targetHeight)
+			return lines, wrapError(i, n.orientation, err)
 		}
-		if len(lines) < targetHeigth {
-			lines = append(lines, make([]string, targetHeigth-len(lines))...)
+		if len(lines) < targetHeight {
+			lines = append(lines, make([]string, targetHeight-len(lines))...)
 		}
 		joinedStr = append(joinedStr, lines)
 	}
@@ -200,16 +296,16 @@ func (n *Node) renderHorizontal(modelMap map[string]tea.Model) ([]string, error)
 	// Join the horizontal lines together
 	var allStr []string
 	// y
-	for c := 0; c < targetHeigth; c++ {
+	for c := range targetHeight {
 		fullLine := make([]string, 0, length)
 		// x
-		for i := 0; i < length; i++ {
-			boxWidth := n.Children[i].width
+		for i := range length {
+			boxWidth := n.children[i].width
 			line := joinedStr[i][c]
 			lineWidth := ansi.PrintableRuneWidth(line)
 			if lineWidth > boxWidth {
 				err := fmt.Errorf("model has a too wide line: %s", line)
-				return nil, wrapError(i, n.VerticalStacked, err)
+				return nil, wrapError(i, n.orientation, err)
 			}
 			var pad string
 			if lineWidth < boxWidth {
@@ -218,20 +314,17 @@ func (n *Node) renderHorizontal(modelMap map[string]tea.Model) ([]string, error)
 			fullLine = append(fullLine, line+pad)
 		}
 		var border string
-		if !n.noBorder {
+		if !n.withBorder {
 			border = HorizontalSeparator
 		}
 
 		allStr = append(allStr, strings.Join(fullLine, border))
 	}
 	return allStr, nil
-
 }
 
-// UpdateSize set the width and height of all Node's
-func (b *Boxer) UpdateSize(size tea.WindowSizeMsg) error {
-	return b.LayoutTree.updateSize(size, b.ModelMap)
-}
+// SizeError conveys that for at leased one node or leaf in the Layout-tree there was not enough space left
+type SizeError error
 
 // recursive setting of the height and width according to the orientation and the SizeFunc
 // or evenly if no SizeFunc is provided
@@ -240,13 +333,13 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 	n.width, n.height = size.Width, size.Height
 
 	// reduce size for children if border is set
-	if !n.noBorder {
-		length := len(n.Children)
+	if !n.withBorder {
+		length := len(n.children)
 		if length == 0 {
 			return fmt.Errorf("the border attribute should not be set on a leaf or a node without children")
 		}
 		// subtract the space which is used by the border between the children
-		if n.VerticalStacked {
+		if n.orientation == Vertical {
 			size.Height -= length - 1
 		} else {
 			size.Width -= length - 1
@@ -263,7 +356,7 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 
 	if n.address != "" {
 		// is leaf
-		if len(n.Children) != 0 {
+		if len(n.children) != 0 {
 			return fmt.Errorf("a leaf should not have Children")
 		}
 
@@ -279,11 +372,11 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 
 	// is node
 
-	if n.SizeFunc == nil {
+	if n.sizeFunc == nil {
 
 		// share space evenly
 
-		length := len(n.Children)
+		length := len(n.children)
 		if length == 0 {
 			return fmt.Errorf("no children to render - this node should be a leaf or should not exist")
 		}
@@ -294,7 +387,7 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 		restWidth := size.Width % length
 		var restHeight int
 
-		if n.VerticalStacked {
+		if n.orientation == Vertical {
 			width = size.Width
 			height = size.Height / length
 
@@ -302,7 +395,7 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 			restWidth = 0
 		}
 
-		for i, c := range n.Children {
+		for i, c := range n.children {
 			var tmpWidth, tmpHeight int
 			if restWidth > 0 {
 				tmpWidth = 1
@@ -322,33 +415,33 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 			)
 			if err != nil {
 				layout := "horizontal"
-				if n.VerticalStacked {
+				if n.orientation == Vertical {
 					layout = "vertical"
 				}
 				return fmt.Errorf("Error while updating the %d child in %s layout: %w", i, layout, err)
 			}
-			n.Children[i] = c
+			n.children[i] = c
 		}
 		return nil
 	}
 
 	// has SizeFunc so split the space according to it
 	var sizeList []int
-	if n.VerticalStacked {
-		sizeList = n.SizeFunc(*n, size.Height)
+	if n.orientation == Vertical {
+		sizeList = n.sizeFunc(*n, size.Height)
 	} else {
-		sizeList = n.SizeFunc(*n, size.Width)
+		sizeList = n.sizeFunc(*n, size.Width)
 	}
-	if len(sizeList) != len(n.Children) {
-		return fmt.Errorf("SizeFunc returned %d WindowSizeMsg's but want one for each child and thus: %d", len(sizeList), len(n.Children))
+	if len(sizeList) != len(n.children) {
+		return fmt.Errorf("SizeFunc returned %d WindowSizeMsg's but want one for each child and thus: %d", len(sizeList), len(n.children))
 	}
 	var heightSum, widthSum int
-	for i, c := range n.Children {
+	for i, c := range n.children {
 		// set fixed dimension
 		s := size
 
 		// change variable dimension according to orientation and the SizeFunc
-		if n.VerticalStacked {
+		if n.orientation == Vertical {
 			s.Height = sizeList[i]
 		} else {
 			s.Width = sizeList[i]
@@ -357,15 +450,15 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 		err := c.updateSize(s, modelMap)
 		if err != nil {
 			layout := "horizontal"
-			if n.VerticalStacked {
+			if n.orientation == Vertical {
 				layout = "vertical"
 			}
 			return fmt.Errorf("Error while updating the %d child in %s layout: %w", i, layout, err)
 		}
-		n.Children[i] = c
+		n.children[i] = c
 
 		// check sanity
-		if n.VerticalStacked {
+		if n.orientation == Vertical {
 			heightSum += s.Height
 			continue
 		}
@@ -373,7 +466,7 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 	}
 
 	// the sum of the children size can not be bigger what the parent provided
-	if n.VerticalStacked && heightSum > size.Height {
+	if n.orientation == Vertical && heightSum > size.Height {
 		return fmt.Errorf("SizeFunc spread more height than it can")
 	}
 	if widthSum > size.Width {
@@ -382,73 +475,10 @@ func (n *Node) updateSize(size tea.WindowSizeMsg, modelMap map[string]tea.Model)
 	return nil
 }
 
-// CreateLeaf is the only way to create a Node which is treated as a Leaf in the layout-tree.
-func (b *Boxer) CreateLeaf(address string, model tea.Model) (Node, error) {
-	if address == "" {
-		return Node{}, fmt.Errorf("address should not be empty")
-	}
-	if model == nil {
-		return Node{}, fmt.Errorf("model should not be nil")
-	}
-	if b.ModelMap == nil {
-		b.ModelMap = make(map[string]tea.Model)
-	}
-	b.ModelMap[address] = model
-	return Node{
-		address:  address,
-		noBorder: true,
-	}, nil
-}
-
-// EditLeaf is a saver way to interact with the Leafs,
-// since it can not be forgotten to save back the Model after changing.
-// If the editFunc returns an error the Model is not saved.
-func (b *Boxer) EditLeaf(address string, editFunc func(tea.Model) (tea.Model, error)) error {
-	model, ok := b.ModelMap[address]
-	if !ok {
-		return NotFoundError(fmt.Errorf("address '%s' not found", address))
-	}
-
-	model, err := editFunc(model)
-	// discard if error
-	if err != nil {
-		return err
-	}
-
-	// accept change
-	b.ModelMap[address] = model
-	return nil
-}
-
-// IsLeaf returns if the node is a leaf.
-func (n *Node) IsLeaf() bool {
-	return n.address != ""
-}
-
-// GetAddress returns the Address of the Node
-// The address of a Node is only settable through CreateLeaf
-func (n *Node) GetAddress() string {
-	return n.address
-}
-
-// GetWidth returns the current with of this node
-func (n *Node) GetWidth() int { return n.width }
-
-// GetHeight returns the current with of this node
-func (n *Node) GetHeight() int { return n.height }
-
-// CreateNoBorderNode is a constructor for a Node which does not draw a Border around its children.
-// Be aware that this is not recursiv, so all contained children may still have borderes.
-// The Border attribute is private, because the changing of the attribute has to be accompanied with a change of size
-// of all its descendants and is not trivial to facilitate in a save manner.
-func CreateNoBorderNode() Node {
-	return Node{noBorder: true}
-}
-
-func wrapError(index int, vertical bool, toWrap error) error {
+func wrapError(index int, o Orientation, toWrap error) error {
 	index++
 	layout := "horizontal"
-	if vertical {
+	if o == Vertical {
 		layout = "vertical"
 	}
 	return fmt.Errorf("while rendering the %d child of a %s node a error occured:\n%w", index, layout, toWrap)
