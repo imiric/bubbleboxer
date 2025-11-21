@@ -57,12 +57,10 @@ func main() {
 			stripErr(m.tui.CreateLeaf(lowerAddr, lower)),
 		},
 	}
-	p := tea.NewProgram(m)
-	p.EnterAltScreen()
-	if err := p.Start(); err != nil {
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
 		fmt.Println(err)
 	}
-	p.ExitAltScreen()
 }
 
 func stripErr(n boxer.Node, _ error) boxer.Node {
