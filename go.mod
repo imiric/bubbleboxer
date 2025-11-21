@@ -1,4 +1,4 @@
-module github.com/treilik/bubbleboxer
+module github.com/imiric/bubbleboxer
 
 go 1.17
 

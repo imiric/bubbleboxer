@@ -6,7 +6,7 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	boxer "github.com/treilik/bubbleboxer"
+	boxer "github.com/imiric/bubbleboxer"
 )
 
 const (
@@ -76,6 +76,7 @@ type model struct {
 func (m model) Init() tea.Cmd {
 	return spinner.Tick
 }
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -95,6 +96,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	return m, nil
 }
+
 func (m model) View() string {
 	return m.tui.View()
 }
@@ -133,11 +135,13 @@ type spinnerHolder struct {
 func (s spinnerHolder) Init() tea.Cmd {
 	return s.m.Tick
 }
+
 func (s spinnerHolder) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m, cmd := s.m.Update(msg)
 	s.m = m
 	return s, cmd
 }
+
 func (s spinnerHolder) View() string {
 	return s.m.View()
 }
@@ -149,6 +153,7 @@ type viewPortHolder struct {
 func (v viewPortHolder) Init() tea.Cmd {
 	return nil
 }
+
 func (v viewPortHolder) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	size, ok := msg.(tea.WindowSizeMsg)
 	if ok {
@@ -160,6 +165,7 @@ func (v viewPortHolder) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	v.m = m
 	return v, cmd
 }
+
 func (v viewPortHolder) View() string {
 	return v.m.View()
 }
